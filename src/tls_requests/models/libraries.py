@@ -34,9 +34,9 @@ ARCH_MAPPING = {
     "i386": "386",
     "arm64": "arm64",
     "aarch64": "arm64",
-    "armv5l": "arm-5",
-    "armv6l": "arm-6",
-    "armv7l": "arm-7",
+    "armv5l": "armv5",
+    "armv6l": "armv6",
+    "armv7l": "armv7",
     "ppc64le": "ppc64le",
     "riscv64": "riscv64",
     "s390x": "s390x",
@@ -70,6 +70,7 @@ elif PLATFORM == "darwin":
 PATTERN_RE = re.compile(r"%s-%s.*%s" % (PLATFORM, MACHINE, FILE_EXT), re.I)
 PATTERN_UBUNTU_RE = re.compile(r"%s-%s.*%s" % ("ubuntu", MACHINE, FILE_EXT), re.I)
 TLS_LIBRARY_PATH = os.getenv("TLS_LIBRARY_PATH")
+TLS_LIBRARY_URL = os.getenv("TLS_LIBRARY_URL")
 
 
 @dataclass
@@ -261,19 +262,21 @@ class TLSLibrary:
                     target_arches.insert(0, win_arch_map[MACHINE])
 
                 # Generate a few potential candidates for the fallback URL
-                platforms = [PLATFORM]
-                if IS_UBUNTU:
-                    platforms.insert(0, "ubuntu")
-
-                for plat in platforms:
-                    for arch in target_arches:
-                        # Try with 'v' and without 'v' in filename as naming patterns vary
-                        for v_str in [v_tag, v_tag.lstrip("v")]:
-                            direct_filename = f"tls-client-{plat}-{arch}-{v_str}.{FILE_EXT}"
-                            direct_url = (
-                                f"https://github.com/bogdanfinn/tls-client/releases/download/{v_tag}/{direct_filename}"
+                for arch in target_arches:
+                    # Try with 'v' and without 'v' in filename as naming patterns vary
+                    for v_str in [v_tag, v_tag.lstrip("v")]:
+                        if IS_UBUNTU:
+                            # Ubuntu releases use linux-ubuntu-<arch> naming
+                            ubuntu_filename = f"tls-client-linux-ubuntu-{arch}-{v_str}.{FILE_EXT}"
+                            ubuntu_url = (
+                                f"https://github.com/bogdanfinn/tls-client/releases/download/{v_tag}/{ubuntu_filename}"
                             )
-                            asset_urls.append(direct_url)
+                            ubuntu_urls.append(ubuntu_url)
+                        direct_filename = f"tls-client-{PLATFORM}-{arch}-{v_str}.{FILE_EXT}"
+                        direct_url = (
+                            f"https://github.com/bogdanfinn/tls-client/releases/download/{v_tag}/{direct_filename}"
+                        )
+                        asset_urls.append(direct_url)
 
                 logger.info(f"Fallback: generated direct download URLs: {', '.join(asset_urls)}")
 
@@ -309,7 +312,7 @@ class TLSLibrary:
     upgrade = update
 
     @classmethod
-    def download(cls, version: Optional[str] = None) -> Optional[str]:
+    def download(cls, version: Optional[str] = None, url: Optional[str] = None) -> Optional[str]:
         try:
             logger.info(
                 "System Info - Platform: %s, Machine: %s, File Ext : %s."
@@ -320,7 +323,8 @@ class TLSLibrary:
                 )
             )
             download_url = None
-            for url in cls.fetch_api(version):
+            url_iterator = iter([url]) if url else cls.fetch_api(version)
+            for url in url_iterator:
                 if not url:
                     continue
 
@@ -406,6 +410,16 @@ class TLSLibrary:
         if TLS_LIBRARY_PATH:
             logger.info(f"Loading TLS library from environment variable: {TLS_LIBRARY_PATH}")
             return _load_library(TLS_LIBRARY_PATH)
+
+        if TLS_LIBRARY_URL:
+            logger.info(f"Downloading TLS library from custom URL (TLS_LIBRARY_URL): {TLS_LIBRARY_URL}")
+            downloaded_fp = cls.download(url=TLS_LIBRARY_URL)
+            if downloaded_fp:
+                cls.cleanup_files(keep_file=downloaded_fp)
+                library = _load_library(downloaded_fp)
+                if library:
+                    return library
+            raise OSError(f"Failed to download the TLS library from TLS_LIBRARY_URL: {TLS_LIBRARY_URL}")
 
         logger.debug(f"Required library version: {LATEST_VERSION_TAG_NAME}")
         local_files = cls.find_all()
