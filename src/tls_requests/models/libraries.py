@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import sys
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, fields
@@ -140,6 +141,7 @@ class TLSLibrary:
 
     _PATH: Optional[str] = None
     _LIBRARY: Optional[ctypes.CDLL] = None
+    _LOAD_LOCK: threading.Lock = threading.Lock()
 
     @staticmethod
     def _parse_version(version_string: str) -> Tuple[int, ...]:
@@ -385,89 +387,98 @@ class TLSLibrary:
         """
         Loads the TLS library. It checks for the correct version, downloads it if
         the local version is outdated or missing, and then loads it into memory.
+        Thread-safe: only one thread will download/load; the rest wait and reuse the result.
         """
         target_version = cls._parse_version(LATEST_VERSION_TAG_NAME)
 
+        # Fast path: library already loaded, no lock needed
         if cls._LIBRARY and cls._PATH:
             cached_version = cls._parse_version_from_filename(cls._PATH)
             if cached_version == target_version:
                 return cls._LIBRARY
 
-        def _load_library(fp_):
-            try:
-                lib = ctypes.cdll.LoadLibrary(fp_)
-                cls.set_path(fp_)
-                cls._LIBRARY = lib
-                logger.info(f"Successfully loaded TLS library: {fp_}")
-                return lib
-            except Exception as ex:
-                logger.error(f"Unable to load TLS library '{fp_}', details: {ex}")
+        with cls._LOAD_LOCK:
+            # Re-check inside lock in case another thread already loaded it
+            if cls._LIBRARY and cls._PATH:
+                cached_version = cls._parse_version_from_filename(cls._PATH)
+                if cached_version == target_version:
+                    return cls._LIBRARY
+
+            def _load_library(fp_):
                 try:
-                    os.remove(fp_)
-                except (FileNotFoundError, PermissionError):
-                    pass
+                    lib = ctypes.cdll.LoadLibrary(fp_)
+                    cls.set_path(fp_)
+                    cls._LIBRARY = lib
+                    logger.info(f"Successfully loaded TLS library: {fp_}")
+                    return lib
+                except Exception as ex:
+                    logger.error(f"Unable to load TLS library '{fp_}', details: {ex}")
+                    try:
+                        os.remove(fp_)
+                    except (FileNotFoundError, PermissionError):
+                        pass
 
-        if TLS_LIBRARY_PATH:
-            logger.info(f"Loading TLS library from environment variable: {TLS_LIBRARY_PATH}")
-            return _load_library(TLS_LIBRARY_PATH)
+            if TLS_LIBRARY_PATH:
+                logger.info(f"Loading TLS library from environment variable: {TLS_LIBRARY_PATH}")
+                return _load_library(TLS_LIBRARY_PATH)
 
-        if TLS_LIBRARY_URL:
-            logger.info(f"Downloading TLS library from custom URL (TLS_LIBRARY_URL): {TLS_LIBRARY_URL}")
-            downloaded_fp = cls.download(url=TLS_LIBRARY_URL)
-            if downloaded_fp:
-                cls.cleanup_files(keep_file=downloaded_fp)
-                library = _load_library(downloaded_fp)
-                if library:
-                    return library
-            raise OSError(f"Failed to download the TLS library from TLS_LIBRARY_URL: {TLS_LIBRARY_URL}")
+            if TLS_LIBRARY_URL:
+                logger.info(f"Downloading TLS library from custom URL (TLS_LIBRARY_URL): {TLS_LIBRARY_URL}")
+                downloaded_fp = cls.download(url=TLS_LIBRARY_URL)
+                if downloaded_fp:
+                    cls.cleanup_files(keep_file=downloaded_fp)
+                    library = _load_library(downloaded_fp)
+                    if library:
+                        return library
+                raise OSError(f"Failed to download the TLS library from TLS_LIBRARY_URL: {TLS_LIBRARY_URL}")
 
-        logger.debug(f"Required library version: {LATEST_VERSION_TAG_NAME}")
-        local_files = cls.find_all()
-        newest_local_version: tuple[int, ...] = (0, 0, 0)
-        newest_local_file = None
+            logger.debug(f"Required library version: {LATEST_VERSION_TAG_NAME}")
+            local_files = cls.find_all()
+            newest_local_version: tuple[int, ...] = (0, 0, 0)
+            newest_local_file = None
 
-        if local_files:
-            for file_path in local_files:
-                file_version = cls._parse_version_from_filename(file_path)
-                if file_version > newest_local_version:
-                    newest_local_version = file_version
-                    newest_local_file = file_path
-            logger.debug(
-                f"Found newest local library: {newest_local_file} (version {'.'.join(map(str, newest_local_version))})"
-            )
-        else:
-            logger.debug("No local library found.")
-
-        if newest_local_version < target_version:
-            if newest_local_file:
-                logger.warning(
-                    f"Local library is outdated (Found: {'.'.join(map(str, newest_local_version))}, "
-                    f"Required: {LATEST_VERSION_TAG_NAME}). "
-                    f"Auto-downloading... To manually upgrade, run: `python -m tls_requests.models.libraries`"
+            if local_files:
+                for file_path in local_files:
+                    file_version = cls._parse_version_from_filename(file_path)
+                    if file_version > newest_local_version:
+                        newest_local_version = file_version
+                        newest_local_file = file_path
+                logger.debug(
+                    f"Found newest local library: {newest_local_file} (version {'.'.join(map(str, newest_local_version))})"
                 )
             else:
-                logger.info(f"Downloading required library version {LATEST_VERSION_TAG_NAME}...")
+                logger.debug("No local library found.")
 
-            downloaded_fp = cls.download(version=LATEST_VERSION_TAG_NAME)
-            if downloaded_fp:
-                cls.cleanup_files(keep_file=downloaded_fp)
-                library = _load_library(downloaded_fp)
+            if newest_local_version < target_version:
+                if newest_local_file:
+                    logger.warning(
+                        f"Local library is outdated (Found: {'.'.join(map(str, newest_local_version))}, "
+                        f"Required: {LATEST_VERSION_TAG_NAME}). "
+                        f"Auto-downloading... To manually upgrade, run: `python -m tls_requests.models.libraries`"
+                    )
+                else:
+                    logger.info(f"Downloading required library version {LATEST_VERSION_TAG_NAME}...")
+
+                downloaded_fp = cls.download(version=LATEST_VERSION_TAG_NAME)
+                if downloaded_fp:
+                    cls.cleanup_files(keep_file=downloaded_fp)
+                    library = _load_library(downloaded_fp)
+                    if library:
+                        return library
+
+                logger.error(
+                    f"Failed to download the required TLS library {LATEST_VERSION_TAG_NAME}. "
+                    "Please check your connection or download it manually from GitHub."
+                )
+                raise OSError("Failed to download the required TLS library.")
+
+            if newest_local_file:
+                library = _load_library(newest_local_file)
                 if library:
+                    cls.cleanup_files(keep_file=newest_local_file)
                     return library
 
-            logger.error(
-                f"Failed to download the required TLS library {LATEST_VERSION_TAG_NAME}. "
-                "Please check your connection or download it manually from GitHub."
-            )
-            raise OSError("Failed to download the required TLS library.")
-
-        if newest_local_file:
-            library = _load_library(newest_local_file)
-            if library:
-                cls.cleanup_files(keep_file=newest_local_file)
-                return library
-
-        raise OSError("Could not find or load a compatible TLS library.")
+            raise OSError("Could not find or load a compatible TLS library.")
 
 
 if __name__ == "__main__":
